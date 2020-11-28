@@ -18,15 +18,18 @@ namespace Renci.SshNet
         /// Uploads the specified file to the remote host.
         /// </summary>
         /// <param name="fileInfo">The file system info.</param>
-        /// <param name="path">The path.</param>
+        /// <param name="path">A relative or absolute path for the remote file.</param>
         /// <exception cref="ArgumentNullException"><paramref name="fileInfo" /> is <c>null</c>.</exception>
-        /// <exception cref="ArgumentException"><paramref name="path"/> is <c>null</c> or empty.</exception>
+        /// <exception cref="ArgumentNullException"><paramref name="path" /> is <c>null</c>.</exception>
+        /// <exception cref="ArgumentException"><paramref name="path"/> is a zero-length <see cref="string"/>.</exception>
+        /// <exception cref="ScpException">A directory with the specified path exists on the remote host.</exception>
+        /// <exception cref="SshException">The secure copy execution request was rejected by the server.</exception>
         public void Upload(FileInfo fileInfo, string path)
         {
             if (fileInfo == null)
                 throw new ArgumentNullException("fileInfo");
-            if (string.IsNullOrEmpty(path))
-                throw new ArgumentException("path");
+
+            var posixPath = PosixPath.CreateAbsoluteOrRelativeFilePath(path);
 
             using (var input = ServiceFactory.CreatePipeStream())
             using (var channel = Session.CreateChannelSession())
@@ -34,12 +37,20 @@ namespace Renci.SshNet
                 channel.DataReceived += (sender, e) => input.Write(e.Data, 0, e.Data.Length);
                 channel.Open();
 
-                if (!channel.SendExecRequest(string.Format("scp -t \"{0}\"", path)))
-                    throw new SshException("Secure copy execution request was rejected by the server. Please consult the server logs.");
-
+                // Pass only the directory part of the path to the server, and use the (hidden) -d option to signal
+                // that we expect the target to be a directory.
+                if (!channel.SendExecRequest(string.Format("scp -t -d {0}", _remotePathTransformation.Transform(posixPath.Directory))))
+                {
+                    throw SecureExecutionRequestRejectedException();
+                }
                 CheckReturnCode(input);
 
-                InternalUpload(channel, input, fileInfo, fileInfo.Name);
+                using (var source = fileInfo.OpenRead())
+                {
+                    UploadTimes(channel, input, fileInfo);
+                    UploadFileModeAndName(channel, input, source.Length, posixPath.File);
+                    UploadFileContent(channel, input, source, fileInfo.Name);
+                }
             }
         }
 
@@ -47,15 +58,20 @@ namespace Renci.SshNet
         /// Uploads the specified directory to the remote host.
         /// </summary>
         /// <param name="directoryInfo">The directory info.</param>
-        /// <param name="path">The path.</param>
-        /// <exception cref="ArgumentNullException">fileSystemInfo</exception>
-        /// <exception cref="ArgumentException"><paramref name="path"/> is <c>null</c> or empty.</exception>
+        /// <param name="path">A relative or absolute path for the remote directory.</param>
+        /// <exception cref="ArgumentNullException"><paramref name="directoryInfo"/> is <c>null</c>.</exception>
+        /// <exception cref="ArgumentNullException"><paramref name="path"/> is <c>null</c>.</exception>
+        /// <exception cref="ArgumentException"><paramref name="path"/> is a zero-length string.</exception>
+        /// <exception cref="ScpException"><paramref name="path"/> does not exist on the remote host, is not a directory or the user does not have the required permission.</exception>
+        /// <exception cref="SshException">The secure copy execution request was rejected by the server.</exception>
         public void Upload(DirectoryInfo directoryInfo, string path)
         {
             if (directoryInfo == null)
                 throw new ArgumentNullException("directoryInfo");
-            if (string.IsNullOrEmpty(path))
-                throw new ArgumentException("path");
+            if (path == null)
+                throw new ArgumentNullException("path");
+            if (path.Length == 0)
+                throw new ArgumentException("The path cannot be a zero-length string.", "path");
 
             using (var input = ServiceFactory.CreatePipeStream())
             using (var channel = Session.CreateChannelSession())
@@ -63,18 +79,19 @@ namespace Renci.SshNet
                 channel.DataReceived += (sender, e) => input.Write(e.Data, 0, e.Data.Length);
                 channel.Open();
 
-                //  Send channel command request
-                channel.SendExecRequest(string.Format("scp -rt \"{0}\"", path));
+                // start copy with the following options:
+                // -p preserve modification and access times
+                // -r copy directories recursively
+                // -d expect path to be a directory
+                // -t copy to remote
+                if (!channel.SendExecRequest(string.Format("scp -r -p -d -t {0}", _remotePathTransformation.Transform(path))))
+                {
+                    throw SecureExecutionRequestRejectedException();
+                }
+
                 CheckReturnCode(input);
 
-                InternalSetTimestamp(channel, input, directoryInfo.LastWriteTimeUtc, directoryInfo.LastAccessTimeUtc);
-                SendData(channel, string.Format("D0755 0 {0}\n", Path.GetFileName(path)));
-                CheckReturnCode(input);
-
-                InternalUpload(channel, input, directoryInfo);
-
-                SendData(channel, "E\n");
-                CheckReturnCode(input);
+                UploadDirectoryContent(channel, input, directoryInfo);
             }
         }
 
@@ -85,6 +102,8 @@ namespace Renci.SshNet
         /// <param name="fileInfo">Local file information.</param>
         /// <exception cref="ArgumentNullException"><paramref name="fileInfo"/> is <c>null</c>.</exception>
         /// <exception cref="ArgumentException"><paramref name="filename"/> is <c>null</c> or empty.</exception>
+        /// <exception cref="ScpException"><paramref name="filename"/> exists on the remote host, and is not a regular file.</exception>
+        /// <exception cref="SshException">The secure copy execution request was rejected by the server.</exception>
         public void Download(string filename, FileInfo fileInfo)
         {
             if (string.IsNullOrEmpty(filename))
@@ -98,9 +117,13 @@ namespace Renci.SshNet
                 channel.DataReceived += (sender, e) => input.Write(e.Data, 0, e.Data.Length);
                 channel.Open();
 
-                //  Send channel command request
-                channel.SendExecRequest(string.Format("scp -pf \"{0}\"", filename));
-                SendConfirmation(channel); //  Send reply
+                // Send channel command request
+                if (!channel.SendExecRequest(string.Format("scp -pf {0}", _remotePathTransformation.Transform(filename))))
+                {
+                    throw SecureExecutionRequestRejectedException();
+                }
+                // Send reply
+                SendSuccessConfirmation(channel);
 
                 InternalDownload(channel, input, fileInfo);
             }
@@ -113,6 +136,8 @@ namespace Renci.SshNet
         /// <param name="directoryInfo">Local directory information.</param>
         /// <exception cref="ArgumentException"><paramref name="directoryName"/> is <c>null</c> or empty.</exception>
         /// <exception cref="ArgumentNullException"><paramref name="directoryInfo"/> is <c>null</c>.</exception>
+        /// <exception cref="ScpException">File or directory with the specified path does not exist on the remote host.</exception>
+        /// <exception cref="SshException">The secure copy execution request was rejected by the server.</exception>
         public void Download(string directoryName, DirectoryInfo directoryInfo)
         {
             if (string.IsNullOrEmpty(directoryName))
@@ -126,45 +151,75 @@ namespace Renci.SshNet
                 channel.DataReceived += (sender, e) => input.Write(e.Data, 0, e.Data.Length);
                 channel.Open();
 
-                //  Send channel command request
-                channel.SendExecRequest(string.Format("scp -prf \"{0}\"", directoryName));
-                SendConfirmation(channel); //  Send reply
+                // Send channel command request
+                if (!channel.SendExecRequest(string.Format("scp -prf {0}", _remotePathTransformation.Transform(directoryName))))
+                {
+                    throw SecureExecutionRequestRejectedException();
+                }
+                // Send reply
+                SendSuccessConfirmation(channel);
 
                 InternalDownload(channel, input, directoryInfo);
             }
         }
 
-        private void InternalUpload(IChannelSession channel, Stream input, FileInfo fileInfo, string filename)
+        /// <summary>
+        /// Uploads the <see cref="FileSystemInfo.LastWriteTimeUtc"/> and <see cref="FileSystemInfo.LastAccessTimeUtc"/>
+        /// of the next file or directory to upload.
+        /// </summary>
+        /// <param name="channel">The channel to perform the upload in.</param>
+        /// <param name="input">A <see cref="Stream"/> from which any feedback from the server can be read.</param>
+        /// <param name="fileOrDirectory">The file or directory to upload.</param>
+        private void UploadTimes(IChannelSession channel, Stream input, FileSystemInfo fileOrDirectory)
         {
-            InternalSetTimestamp(channel, input, fileInfo.LastWriteTimeUtc, fileInfo.LastAccessTimeUtc);
-            using (var source = fileInfo.OpenRead())
-            {
-                InternalUpload(channel, input, source, filename);
-            }
+            var zeroTime = new DateTime(1970, 1, 1, 0, 0, 0, 0, DateTimeKind.Utc);
+            var modificationSeconds = (long) (fileOrDirectory.LastWriteTimeUtc - zeroTime).TotalSeconds;
+            var accessSeconds = (long) (fileOrDirectory.LastAccessTimeUtc - zeroTime).TotalSeconds;
+            SendData(channel, string.Format("T{0} 0 {1} 0\n", modificationSeconds, accessSeconds));
+            CheckReturnCode(input);
         }
 
-        private void InternalUpload(IChannelSession channel, Stream input, DirectoryInfo directoryInfo)
+        /// <summary>
+        /// Upload the files and subdirectories in the specified directory.
+        /// </summary>
+        /// <param name="channel">The channel to perform the upload in.</param>
+        /// <param name="input">A <see cref="Stream"/> from which any feedback from the server can be read.</param>
+        /// <param name="directoryInfo">The directory to upload.</param>
+        private void UploadDirectoryContent(IChannelSession channel, Stream input, DirectoryInfo directoryInfo)
         {
             //  Upload files
             var files = directoryInfo.GetFiles();
             foreach (var file in files)
             {
-                InternalUpload(channel, input, file, file.Name);
+                using (var source = file.OpenRead())
+                {
+                    UploadTimes(channel, input, file);
+                    UploadFileModeAndName(channel, input, source.Length, file.Name);
+                    UploadFileContent(channel, input, source, file.Name);
+                }
             }
 
             //  Upload directories
             var directories = directoryInfo.GetDirectories();
             foreach (var directory in directories)
             {
-                InternalSetTimestamp(channel, input, directoryInfo.LastWriteTimeUtc, directoryInfo.LastAccessTimeUtc);
-                SendData(channel, string.Format("D0755 0 {0}\n", directory.Name));
-                CheckReturnCode(input);
-
-                InternalUpload(channel, input, directory);
-
-                SendData(channel, "E\n");
-                CheckReturnCode(input);
+                UploadTimes(channel, input, directory);
+                UploadDirectoryModeAndName(channel, input, directory.Name);
+                UploadDirectoryContent(channel, input, directory);
             }
+
+            // Mark upload of current directory complete
+            SendData(channel, "E\n");
+            CheckReturnCode(input);
+        }
+
+        /// <summary>
+        /// Sets mode and name of the directory being upload.
+        /// </summary>
+        private void UploadDirectoryModeAndName(IChannelSession channel, Stream input, string directoryName)
+        {
+            SendData(channel, string.Format("D0755 0 {0}\n", directoryName));
+            CheckReturnCode(input);
         }
 
         private void InternalDownload(IChannelSession channel, Stream input, FileSystemInfo fileSystemInfo)
@@ -182,7 +237,7 @@ namespace Renci.SshNet
 
                 if (message == "E")
                 {
-                    SendConfirmation(channel); //  Send reply
+                    SendSuccessConfirmation(channel); //  Send reply
 
                     directoryCounter--;
 
@@ -196,22 +251,21 @@ namespace Renci.SshNet
                 var match = DirectoryInfoRe.Match(message);
                 if (match.Success)
                 {
-                    SendConfirmation(channel); //  Send reply
+                    SendSuccessConfirmation(channel); //  Send reply
 
                     //  Read directory
-                    var mode = long.Parse(match.Result("${mode}"));
                     var filename = match.Result("${filename}");
 
                     DirectoryInfo newDirectoryInfo;
                     if (directoryCounter > 0)
                     {
-                        newDirectoryInfo = Directory.CreateDirectory(string.Format("{0}{1}{2}", currentDirectoryFullName, Path.DirectorySeparatorChar, filename));
+                        newDirectoryInfo = Directory.CreateDirectory(Path.Combine(currentDirectoryFullName, filename));
                         newDirectoryInfo.LastAccessTime = accessedTime;
                         newDirectoryInfo.LastWriteTime = modifiedTime;
                     }
                     else
                     {
-                        //  Dont create directory for first level
+                        //  Don't create directory for first level
                         newDirectoryInfo = fileSystemInfo as DirectoryInfo;
                     }
 
@@ -225,16 +279,15 @@ namespace Renci.SshNet
                 if (match.Success)
                 {
                     //  Read file
-                    SendConfirmation(channel); //  Send reply
+                    SendSuccessConfirmation(channel); //  Send reply
 
-                    var mode = match.Result("${mode}");
                     var length = long.Parse(match.Result("${length}"));
                     var fileName = match.Result("${filename}");
 
                     var fileInfo = fileSystemInfo as FileInfo;
 
                     if (fileInfo == null)
-                        fileInfo = new FileInfo(string.Format("{0}{1}{2}", currentDirectoryFullName, Path.DirectorySeparatorChar, fileName));
+                        fileInfo = new FileInfo(Path.Combine(currentDirectoryFullName, fileName));
 
                     using (var output = fileInfo.OpenWrite())
                     {
@@ -253,7 +306,7 @@ namespace Renci.SshNet
                 if (match.Success)
                 {
                     //  Read timestamp
-                    SendConfirmation(channel); //  Send reply
+                    SendSuccessConfirmation(channel); //  Send reply
 
                     var mtime = long.Parse(match.Result("${mtime}"));
                     var atime = long.Parse(match.Result("${atime}"));
@@ -264,8 +317,42 @@ namespace Renci.SshNet
                     continue;
                 }
 
-                SendConfirmation(channel, 1, string.Format("\"{0}\" is not valid protocol message.", message));
+                SendErrorConfirmation(channel, string.Format("\"{0}\" is not valid protocol message.", message));
             }
+        }
+
+        /// <summary>
+        /// Return a value indicating whether the specified path is a valid SCP file path.
+        /// </summary>
+        /// <param name="path">The path to verify.</param>
+        /// <returns>
+        /// <see langword="true"/> if <paramref name="path"/> is a valid SCP file path; otherwise, <see langword="false"/>.
+        /// </returns>
+        /// <remarks>
+        /// To match OpenSSH behavior (introduced as a result of CVE-2018-20685), a file path is considered
+        /// invalid in any of the following conditions:
+        /// <list type="bullet">
+        ///   <item>
+        ///     <description><paramref name="path"/> is a zero-length string.</description>
+        ///   </item>
+        ///   <item>
+        ///     <description><paramref name="path"/> is &quot;<c>.</c>&quot;.</description>
+        ///   </item>
+        ///   <item>
+        ///     <description><paramref name="path"/> is &quot;<c>..</c>&quot;.</description>
+        ///   </item>
+        ///   <item>
+        ///     <description><paramref name="path"/> contains a forward slash (/).</description>
+        ///   </item>
+        /// </list>
+        /// </remarks>
+        private static bool IsValidScpFilePath(string path)
+        {
+            return path != null &&
+                   path.Length != 0 &&
+                   path != "." &&
+                   path != ".." &&
+                   path.IndexOf('/') == -1;
         }
     }
 }

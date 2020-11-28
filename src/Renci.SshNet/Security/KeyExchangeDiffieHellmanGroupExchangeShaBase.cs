@@ -1,12 +1,11 @@
-﻿using Renci.SshNet.Messages;
-using Renci.SshNet.Messages.Transport;
+﻿using Renci.SshNet.Messages.Transport;
 
 namespace Renci.SshNet.Security
 {
     /// <summary>
     /// Base class for "diffie-hellman-group-exchange" algorithms.
     /// </summary>
-    public abstract class KeyExchangeDiffieHellmanGroupExchangeShaBase : KeyExchangeDiffieHellman
+    internal abstract class KeyExchangeDiffieHellmanGroupExchangeShaBase : KeyExchangeDiffieHellman
     {
         private const int MinimumGroupSize = 1024;
         private const int PreferredGroupSize = 1024;
@@ -20,7 +19,7 @@ namespace Renci.SshNet.Security
         /// </returns>
         protected override byte[] CalculateHash()
         {
-            var hashData = new GroupExchangeHashData
+            var groupExchangeHashData = new GroupExchangeHashData
                 {
                     ClientVersion = Session.ClientVersion,
                     ServerVersion = Session.ServerVersion,
@@ -35,9 +34,9 @@ namespace Renci.SshNet.Security
                     ClientExchangeValue = _clientExchangeValue,
                     ServerExchangeValue = _serverExchangeValue,
                     SharedKey = SharedKey,
-                }.GetBytes();
+                };
 
-            return Hash(hashData);
+            return Hash(groupExchangeHashData.GetBytes());
         }
 
         /// <summary>
@@ -55,8 +54,7 @@ namespace Renci.SshNet.Security
             Session.KeyExchangeDhGroupExchangeGroupReceived += Session_KeyExchangeDhGroupExchangeGroupReceived;
 
             // 1. client sends SSH_MSG_KEY_DH_GEX_REQUEST
-            SendMessage(new KeyExchangeDhGroupExchangeRequest(MinimumGroupSize, PreferredGroupSize,
-                MaximumProupSize));
+            SendMessage(new KeyExchangeDhGroupExchangeRequest(MinimumGroupSize, PreferredGroupSize, MaximumProupSize));
         }
 
         /// <summary>

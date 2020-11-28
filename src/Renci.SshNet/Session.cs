@@ -28,13 +28,13 @@ namespace Renci.SshNet
     {
         private const byte Null = 0x00;
         private const byte CarriageReturn = 0x0d;
-        private const byte LineFeed = 0x0a;
+        internal const byte LineFeed = 0x0a;
 
         /// <summary>
         /// Specifies an infinite waiting period.
         /// </summary>
         /// <remarks>
-        /// The value of this field is <c>-1</c> millisecond. 
+        /// The value of this field is <c>-1</c> millisecond.
         /// </remarks>
         internal static readonly TimeSpan InfiniteTimeSpan = new TimeSpan(0, 0, 0, 0, -1);
 
@@ -49,15 +49,21 @@ namespace Renci.SshNet
         /// <summary>
         /// Specifies maximum packet size defined by the protocol.
         /// </summary>
+        /// <value>
+        /// 68536 (64 KB + 3000 bytes).
+        /// </value>
         private const int MaximumSshPacketSize = LocalChannelDataPacketSize + 3000;
 
         /// <summary>
         /// Holds the initial local window size for the channels.
         /// </summary>
         /// <value>
-        /// 2 MB.
+        /// 2147483647 (2^31 - 1) bytes.
         /// </value>
-        private const int InitialLocalWindowSize = LocalChannelDataPacketSize * 32;
+        /// <remarks>
+        /// We currently do not define a maximum (remote) window size.
+        /// </remarks>
+        private const int InitialLocalWindowSize = 0x7FFFFFFF;
 
         /// <summary>
         /// Holds the maximum size of channel data packets that we receive.
@@ -65,6 +71,15 @@ namespace Renci.SshNet
         /// <value>
         /// 64 KB.
         /// </value>
+        /// <remarks>
+        /// <para>
+        /// This is the maximum size (in bytes) we support for the data (payload) of a
+        /// <c>SSH_MSG_CHANNEL_DATA</c> message we receive.
+        /// </para>
+        /// <para>
+        /// We currently do not enforce this limit.
+        /// </para>
+        /// </remarks>
         private const int LocalChannelDataPacketSize = 1024*64;
 
 #if FEATURE_REGEX_COMPILE
@@ -253,7 +268,7 @@ namespace Renci.SshNet
         ///         <description>The <see cref="Session"/> is disposed.</description>
         ///     </item>
         ///     <item>
-        ///         <description>The SSH_MSG_DISCONNECT message - which is used to disconnect from the server - has been sent.</description>
+        ///         <description>The <c>SSH_MSG_DISCONNECT</c> message - which is used to disconnect from the server - has been sent.</description>
         ///     </item>
         ///     <item>
         ///         <description>The client has not been authenticated successfully.</description>
@@ -425,6 +440,11 @@ namespace Renci.SshNet
         internal event EventHandler<MessageEventArgs<KeyExchangeDhReplyMessage>> KeyExchangeDhReplyMessageReceived;
 
         /// <summary>
+        /// Occurs when a <see cref="KeyExchangeEcdhReplyMessage"/> message is received from the SSH server.
+        /// </summary>
+        internal event EventHandler<MessageEventArgs<KeyExchangeEcdhReplyMessage>> KeyExchangeEcdhReplyMessageReceived;
+
+        /// <summary>
         /// Occurs when <see cref="NewKeysMessage"/> message received
         /// </summary>
         internal event EventHandler<MessageEventArgs<NewKeysMessage>> NewKeysReceived;
@@ -557,14 +577,14 @@ namespace Renci.SshNet
 
                 lock (this)
                 {
-                    //  If connected don't connect again
+                    // If connected don't connect again
                     if (IsConnected)
                         return;
 
-                    // reset connection specific information
+                    // Reset connection specific information
                     Reset();
 
-                    //  Build list of available messages while connecting
+                    // Build list of available messages while connecting
                     _sshMessageFactory = new SshMessageFactory();
 
                     switch (ConnectionInfo.ProxyType)
@@ -574,25 +594,29 @@ namespace Renci.SshNet
                             break;
                         case ProxyTypes.Socks4:
                             SocketConnect(ConnectionInfo.ProxyHost, ConnectionInfo.ProxyPort);
-                            ConnectSocks4();
+                            ConnectSocks4(_socket, ConnectionInfo);
                             break;
                         case ProxyTypes.Socks5:
                             SocketConnect(ConnectionInfo.ProxyHost, ConnectionInfo.ProxyPort);
-                            ConnectSocks5();
+                            ConnectSocks5(_socket, ConnectionInfo);
                             break;
                         case ProxyTypes.Http:
                             SocketConnect(ConnectionInfo.ProxyHost, ConnectionInfo.ProxyPort);
-                            ConnectHttp();
+                            ConnectHttp(_socket, ConnectionInfo);
                             break;
                     }
 
+                    // Immediately send the identification string since the spec states both sides MUST send an identification string
+                    // when the connection has been established
+                    SocketAbstraction.Send(_socket, Encoding.UTF8.GetBytes(string.Format(CultureInfo.InvariantCulture, "{0}\x0D\x0A", ClientVersion)));
+
                     Match versionMatch;
 
-                    //  Get server version from the server,
-                    //  ignore text lines which are sent before if any
+                    // Get server version from the server,
+                    // ignore text lines which are sent before if any
                     while (true)
                     {
-                        var serverVersion = SocketReadLine(ConnectionInfo.Timeout);
+                        var serverVersion = SocketReadLine(_socket, ConnectionInfo.Timeout);
                         if (serverVersion == null)
                             throw new SshConnectionException("Server response does not contain SSH protocol identification.", DisconnectReason.ProtocolError);
                         versionMatch = ServerVersionRe.Match(serverVersion);
@@ -603,11 +627,11 @@ namespace Renci.SshNet
                         }
                     }
 
-                    //  Set connection versions
+                    // Set connection versions
                     ConnectionInfo.ServerVersion = ServerVersion;
                     ConnectionInfo.ClientVersion = ClientVersion;
 
-                    //  Get server SSH version
+                    // Get server SSH version
                     var version = versionMatch.Result("${protoversion}");
 
                     var softwareName = versionMatch.Result("${softwareversion}");
@@ -619,9 +643,7 @@ namespace Renci.SshNet
                         throw new SshConnectionException(string.Format(CultureInfo.CurrentCulture, "Server version '{0}' is not supported.", version), DisconnectReason.ProtocolVersionNotSupported);
                     }
 
-                    SocketAbstraction.Send(_socket, Encoding.UTF8.GetBytes(string.Format(CultureInfo.InvariantCulture, "{0}\x0D\x0A", ClientVersion)));
-
-                    //  Register Transport response messages
+                    // Register Transport response messages
                     RegisterMessage("SSH_MSG_DISCONNECT");
                     RegisterMessage("SSH_MSG_IGNORE");
                     RegisterMessage("SSH_MSG_UNIMPLEMENTED");
@@ -630,29 +652,29 @@ namespace Renci.SshNet
                     RegisterMessage("SSH_MSG_KEXINIT");
                     RegisterMessage("SSH_MSG_NEWKEYS");
 
-                    //  Some server implementations might sent this message first, prior establishing encryption algorithm
+                    // Some server implementations might sent this message first, prior to establishing encryption algorithm
                     RegisterMessage("SSH_MSG_USERAUTH_BANNER");
 
-                    // mark the message listener threads as started
+                    // Mark the message listener threads as started
                     _messageListenerCompleted.Reset();
 
-                    //  Start incoming request listener
-                    ThreadAbstraction.ExecuteThread(MessageListener);
+                    // Start incoming request listener
+                    ThreadAbstraction.ExecuteThread(() => MessageListener());
 
-                    //  Wait for key exchange to be completed
+                    // Wait for key exchange to be completed
                     WaitOnHandle(_keyExchangeCompletedWaitHandle);
 
-                    //  If sessionId is not set then its not connected
+                    // If sessionId is not set then its not connected
                     if (SessionId == null)
                     {
                         Disconnect();
                         return;
                     }
 
-                    //  Request user authorization service
+                    // Request user authorization service
                     SendMessage(new ServiceRequestMessage(ServiceName.UserAuthentication));
 
-                    //  Wait for service to be accepted
+                    // Wait for service to be accepted
                     WaitOnHandle(_serviceAccepted);
 
                     if (string.IsNullOrEmpty(ConnectionInfo.Username))
@@ -667,7 +689,7 @@ namespace Renci.SshNet
                     ConnectionInfo.Authenticate(this, _serviceFactory);
                     _isAuthenticated = true;
 
-                    //  Register Connection messages
+                    // Register Connection messages
                     RegisterMessage("SSH_MSG_REQUEST_SUCCESS");
                     RegisterMessage("SSH_MSG_REQUEST_FAILURE");
                     RegisterMessage("SSH_MSG_CHANNEL_OPEN_CONFIRMATION");
@@ -697,7 +719,7 @@ namespace Renci.SshNet
         /// </remarks>
         public void Disconnect()
         {
-            DiagnosticAbstraction.Log(string.Format("[{0}] {1} Disconnecting session", ToHex(SessionId), DateTime.Now.Ticks));
+            DiagnosticAbstraction.Log(string.Format("[{0}] Disconnecting session.", ToHex(SessionId)));
 
             // send SSH_MSG_DISCONNECT message, clear socket read buffer and dispose it
             Disconnect(DisconnectReason.ByApplication, "Connection terminated by the client.");
@@ -784,6 +806,82 @@ namespace Renci.SshNet
         }
 
         /// <summary>
+        /// Waits for the specified <seec ref="WaitHandle"/> to receive a signal, using a <see cref="TimeSpan"/>
+        /// to specify the time interval.
+        /// </summary>
+        /// <param name="waitHandle">The <see cref="WaitHandle"/> that should be signaled.</param>
+        /// <param name="timeout">A <see cref="TimeSpan"/> that represents the number of milliseconds to wait, or a <see cref="TimeSpan"/> that represents <c>-1</c> milliseconds to wait indefinitely.</param>
+        /// <returns>
+        /// A <see cref="WaitResult"/>.
+        /// </returns>
+        WaitResult ISession.TryWait(WaitHandle waitHandle, TimeSpan timeout)
+        {
+            Exception exception;
+            return TryWait(waitHandle, timeout, out exception);
+        }
+
+        /// <summary>
+        /// Waits for the specified <seec ref="WaitHandle"/> to receive a signal, using a <see cref="TimeSpan"/>
+        /// to specify the time interval.
+        /// </summary>
+        /// <param name="waitHandle">The <see cref="WaitHandle"/> that should be signaled.</param>
+        /// <param name="timeout">A <see cref="TimeSpan"/> that represents the number of milliseconds to wait, or a <see cref="TimeSpan"/> that represents <c>-1</c> milliseconds to wait indefinitely.</param>
+        /// <param name="exception">When this method returns <see cref="WaitResult.Failed"/>, contains the <see cref="Exception"/>.</param>
+        /// <returns>
+        /// A <see cref="WaitResult"/>.
+        /// </returns>
+        WaitResult ISession.TryWait(WaitHandle waitHandle, TimeSpan timeout, out Exception exception)
+        {
+            return TryWait(waitHandle, timeout, out exception);
+        }
+
+        /// <summary>
+        /// Waits for the specified <seec ref="WaitHandle"/> to receive a signal, using a <see cref="TimeSpan"/>
+        /// to specify the time interval.
+        /// </summary>
+        /// <param name="waitHandle">The <see cref="WaitHandle"/> that should be signaled.</param>
+        /// <param name="timeout">A <see cref="TimeSpan"/> that represents the number of milliseconds to wait, or a <see cref="TimeSpan"/> that represents <c>-1</c> milliseconds to wait indefinitely.</param>
+        /// <param name="exception">When this method returns <see cref="WaitResult.Failed"/>, contains the <see cref="Exception"/>.</param>
+        /// <returns>
+        /// A <see cref="WaitResult"/>.
+        /// </returns>
+        private WaitResult TryWait(WaitHandle waitHandle, TimeSpan timeout, out Exception exception)
+        {
+            if (waitHandle == null)
+                throw new ArgumentNullException("waitHandle");
+
+            var waitHandles = new[]
+                {
+                    _exceptionWaitHandle,
+                    _messageListenerCompleted,
+                    waitHandle
+                };
+
+            switch (WaitHandle.WaitAny(waitHandles, timeout))
+            {
+                case 0:
+                    if (_exception is SshConnectionException)
+                    {
+                        exception = null;
+                        return WaitResult.Disconnected;
+                    }
+                    exception = _exception;
+                    return WaitResult.Failed;
+                case 1:
+                    exception = null;
+                    return WaitResult.Disconnected;
+                case 2:
+                    exception = null;
+                    return WaitResult.Success;
+                case WaitHandle.WaitTimeout:
+                    exception = null;
+                    return WaitResult.TimedOut;
+                default:
+                    throw new InvalidOperationException("Unexpected result.");
+            }
+        }
+
+        /// <summary>
         /// Waits for the specified handle or the exception handle for the receive thread
         /// to signal within the specified timeout.
         /// </summary>
@@ -843,7 +941,7 @@ namespace Renci.SshNet
                 WaitOnHandle(_keyExchangeCompletedWaitHandle);
             }
 
-            DiagnosticAbstraction.Log(string.Format("[{0}] SendMessage to server '{1}': '{2}'.", ToHex(SessionId), message.GetType().Name, message));
+            DiagnosticAbstraction.Log(string.Format("[{0}] Sending message '{1}' to server: '{2}'.", ToHex(SessionId), message.GetType().Name, message));
 
             var paddingMultiplier = _clientCipher == null ? (byte) 8 : Math.Max((byte) 8, _serverCipher.MinimumSize);
             var packetData = message.GetPacket(paddingMultiplier, _clientCompression);
@@ -858,12 +956,12 @@ namespace Renci.SshNet
                 if (_clientMac != null)
                 {
                     // write outbound packet sequence to start of packet data
-                    _outboundPacketSequence.Write(packetData, 0);
+                    Pack.UInt32ToBigEndian(_outboundPacketSequence, packetData);
                     //  calculate packet hash
                     hash = _clientMac.ComputeHash(packetData);
                 }
 
-                //  Encrypt packet data
+                // Encrypt packet data
                 if (_clientCipher != null)
                 {
                     packetData = _clientCipher.Encrypt(packetData, packetDataOffset, (packetData.Length - packetDataOffset));
@@ -882,7 +980,7 @@ namespace Renci.SshNet
                 }
                 else
                 {
-                    var data = new byte[packetLength + (_clientMac.HashSize/8)];
+                    var data = new byte[packetLength + hash.Length];
                     Buffer.BlockCopy(packetData, packetDataOffset, data, 0, packetLength);
                     Buffer.BlockCopy(hash, 0, data, packetLength, hash.Length);
                     SendPacket(data, 0, data.Length);
@@ -947,12 +1045,12 @@ namespace Renci.SshNet
             }
             catch (SshException ex)
             {
-                DiagnosticAbstraction.Log(string.Format("Failure sending message server '{0}': '{1}' => {2}", message.GetType().Name, message, ex));
+                DiagnosticAbstraction.Log(string.Format("Failure sending message '{0}' to server: '{1}' => {2}", message.GetType().Name, message, ex));
                 return false;
             }
             catch (SocketException ex)
             {
-                DiagnosticAbstraction.Log(string.Format("Failure sending message server '{0}': '{1}' => {2}", message.GetType().Name, message, ex));
+                DiagnosticAbstraction.Log(string.Format("Failure sending message '{0}' to server: '{1}' => {2}", message.GetType().Name, message, ex));
                 return false;
             }
         }
@@ -966,7 +1064,7 @@ namespace Renci.SshNet
         /// <remarks>
         /// We need no locking here since all messages are read by a single thread.
         /// </remarks>
-        private Message ReceiveMessage()
+        private Message ReceiveMessage(Socket socket)
         {
             // the length of the packet sequence field in bytes
             const int inboundPacketSequenceLength = 4;
@@ -992,25 +1090,18 @@ namespace Renci.SshNet
 #endif // FEATURE_SOCKET_POLL
                 //  Read first block - which starts with the packet length
                 var firstBlock = new byte[blockSize];
-                if (TrySocketRead(firstBlock, 0, blockSize) == 0)
+                if (TrySocketRead(socket, firstBlock, 0, blockSize) == 0)
                 {
                     // connection with SSH server was closed
                     return null;
                 }
 
-#if DEBUG_GERT
-                DiagnosticAbstraction.Log(string.Format("[{0}] FirstBlock [{1}]: {2}", ToHex(SessionId), blockSize, ToHex(firstBlock)));
-#endif // DEBUG_GERT
-
                 if (_serverCipher != null)
                 {
                     firstBlock = _serverCipher.Decrypt(firstBlock);
-#if DEBUG_GERT
-                    DiagnosticAbstraction.Log(string.Format("[{0}] FirstBlock decrypted [{1}]: {2}", ToHex(SessionId), firstBlock.Length, ToHex(firstBlock)));
-#endif // DEBUG_GERT
                 }
 
-                packetLength = (uint) (firstBlock[0] << 24 | firstBlock[1] << 16 | firstBlock[2] << 8 | firstBlock[3]);
+                packetLength = Pack.BigEndianToUInt32(firstBlock);
 
                 // Test packet minimum and maximum boundaries
                 if (packetLength < Math.Max((byte) 16, blockSize) - 4 || packetLength > MaximumSshPacketSize - 4)
@@ -1034,12 +1125,12 @@ namespace Renci.SshNet
                 // byte[] for the purpose of calculating the client hash. Room for the server MAC is foreseen
                 // to read the packet including server MAC in a single pass (except for the initial block).
                 data = new byte[bytesToRead + blockSize + inboundPacketSequenceLength];
-                _inboundPacketSequence.Write(data, 0);
+                Pack.UInt32ToBigEndian(_inboundPacketSequence, data);
                 Buffer.BlockCopy(firstBlock, 0, data, inboundPacketSequenceLength, firstBlock.Length);
 
                 if (bytesToRead > 0)
                 {
-                    if (TrySocketRead(data, blockSize + inboundPacketSequenceLength, bytesToRead) == 0)
+                    if (TrySocketRead(socket, data, blockSize + inboundPacketSequenceLength, bytesToRead) == 0)
                     {
                         return null;
                     }
@@ -1053,16 +1144,8 @@ namespace Renci.SshNet
                 var numberOfBytesToDecrypt = data.Length - (blockSize + inboundPacketSequenceLength + serverMacLength);
                 if (numberOfBytesToDecrypt > 0)
                 {
-#if DEBUG_GERT
-                    DiagnosticAbstraction.Log(string.Format("[{0}] NextBlocks [{1}]: {2}", ToHex(SessionId), bytesToRead, ToHex(nextBlocks)));
-#endif // DEBUG_GERT
-
                     var decryptedData = _serverCipher.Decrypt(data, blockSize + inboundPacketSequenceLength, numberOfBytesToDecrypt);
                     Buffer.BlockCopy(decryptedData, 0, data, blockSize + inboundPacketSequenceLength, decryptedData.Length);
-
-#if DEBUG_GERT
-                    DiagnosticAbstraction.Log(string.Format("[{0}] NextBlocks decrypted [{1}]: {2}", ToHex(SessionId), decryptedData.Length, ToHex(decryptedData)));
-#endif // DEBUG_GERT
                 }
             }
 
@@ -1076,6 +1159,8 @@ namespace Renci.SshNet
                 var clientHash = _serverMac.ComputeHash(data, 0, data.Length - serverMacLength);
                 var serverHash = data.Take(data.Length - serverMacLength, serverMacLength);
 
+                // TODO add IsEqualTo overload that takes left+right index and number of bytes to compare;
+                // TODO that way we can eliminate the extra allocation of the Take above
                 if (!serverHash.IsEqualTo(clientHash))
                 {
                     throw new SshConnectionException("MAC error", DisconnectReason.MacError);
@@ -1091,10 +1176,6 @@ namespace Renci.SshNet
                 // the length of the payload is now the complete decompressed content
                 messagePayloadLength = data.Length;
             }
-
-#if DEBUG_GERT
-            DiagnosticAbstraction.Log(string.Format("[{0}] Message info (Sequence:{1},MessagePayloadLength:{2})", ToHex(SessionId), _inboundPacketSequence, messagePayloadLength));
-#endif // DEBUG_GERT
 
             _inboundPacketSequence++;
 
@@ -1112,7 +1193,7 @@ namespace Renci.SshNet
             _isDisconnectMessageSent = true;
         }
 
-#region Handle received message events
+        #region Handle received message events
 
         /// <summary>
         /// Called when <see cref="DisconnectMessage"/> received.
@@ -1120,7 +1201,7 @@ namespace Renci.SshNet
         /// <param name="message"><see cref="DisconnectMessage"/> message.</param>
         internal void OnDisconnectReceived(DisconnectMessage message)
         {
-            DiagnosticAbstraction.Log(string.Format("[{0}] {1} Disconnect received: {2} {3}", ToHex(SessionId), DateTime.Now.Ticks, message.ReasonCode, message.Description));
+            DiagnosticAbstraction.Log(string.Format("[{0}] Disconnect received: {1} {2}.", ToHex(SessionId), message.ReasonCode, message.Description));
 
             // transition to disconnecting state to avoid throwing exceptions while cleaning up, and to
             // ensure any exceptions that are raised do not overwrite the SshConnectionException that we
@@ -1227,7 +1308,7 @@ namespace Renci.SshNet
             _sshMessageFactory.DisableNonKeyExchangeMessages();
 
             _keyExchange = _serviceFactory.CreateKeyExchange(ConnectionInfo.KeyExchangeAlgorithms,
-                message.KeyExchangeAlgorithms);
+                                                             message.KeyExchangeAlgorithms);
 
             ConnectionInfo.CurrentKeyExchangeAlgorithm = _keyExchange.Name;
 
@@ -1246,6 +1327,13 @@ namespace Renci.SshNet
             var handlers = KeyExchangeDhReplyMessageReceived;
             if (handlers != null)
                 handlers(this, new MessageEventArgs<KeyExchangeDhReplyMessage>(message));
+        }
+
+        internal void OnKeyExchangeEcdhReplyMessageReceived(KeyExchangeEcdhReplyMessage message)
+        {
+            var handlers = KeyExchangeEcdhReplyMessageReceived;
+            if (handlers != null)
+                handlers(this, new MessageEventArgs<KeyExchangeEcdhReplyMessage>(message));
         }
 
         /// <summary>
@@ -1534,7 +1622,7 @@ namespace Renci.SshNet
                 handlers(this, new MessageEventArgs<ChannelFailureMessage>(message));
         }
 
-#endregion
+        #endregion
 
         private void KeyExchange_HostKeyReceived(object sender, HostKeyEventArgs e)
         {
@@ -1543,7 +1631,7 @@ namespace Renci.SshNet
                 handlers(this, e);
         }
 
-#region Message loading functions
+        #region Message loading functions
 
         /// <summary>
         /// Registers SSH message with the session.
@@ -1578,14 +1666,9 @@ namespace Renci.SshNet
             var messageType = data[offset];
 
             var message = _sshMessageFactory.Create(messageType);
-
-#if DEBUG_GERT
-            DiagnosticAbstraction.Log(string.Format("[{0}] Loading message with offset '{1}': {2}", ToHex(SessionId), offset, ToHex(data, 0)));
-#endif // DEBUG_GERT
-
             message.Load(data, offset + 1, count - 1);
 
-            DiagnosticAbstraction.Log(string.Format("[{0}] ReceiveMessage from server: '{1}': '{2}'.", ToHex(SessionId), message.GetType().Name, message));
+            DiagnosticAbstraction.Log(string.Format("[{0}] Received message '{1}' from server: '{2}'.", ToHex(SessionId), message.GetType().Name, message));
 
             return message;
         }
@@ -1613,7 +1696,7 @@ namespace Renci.SshNet
             return ToHex(bytes, 0);
         }
 
-#endregion
+        #endregion
 
         /// <summary>
         /// Establishes a socket connection to the specified host and port.
@@ -1627,7 +1710,7 @@ namespace Renci.SshNet
             var ipAddress = DnsAbstraction.GetHostAddresses(host)[0];
             var ep = new IPEndPoint(ipAddress, port);
 
-            DiagnosticAbstraction.Log(string.Format("Initiating connect to '{0}:{1}'.", host, port));
+            DiagnosticAbstraction.Log(string.Format("Initiating connection to '{0}:{1}'.", host, port));
 
             _socket = SocketAbstraction.Connect(ep, ConnectionInfo.Timeout);
 
@@ -1639,6 +1722,7 @@ namespace Renci.SshNet
         /// <summary>
         /// Performs a blocking read on the socket until <paramref name="length"/> bytes are received.
         /// </summary>
+        /// <param name="socket">The <see cref="Socket"/> to read from.</param>
         /// <param name="buffer">An array of type <see cref="byte"/> that is the storage location for the received data.</param>
         /// <param name="offset">The position in <paramref name="buffer"/> parameter to store the received data.</param>
         /// <param name="length">The number of bytes to read.</param>
@@ -1648,16 +1732,16 @@ namespace Renci.SshNet
         /// <exception cref="SshConnectionException">The socket is closed.</exception>
         /// <exception cref="SshOperationTimeoutException">The read has timed-out.</exception>
         /// <exception cref="SocketException">The read failed.</exception>
-        private int SocketRead(byte[] buffer, int offset, int length)
+        private static int SocketRead(Socket socket, byte[] buffer, int offset, int length)
         {
-            var bytesRead = SocketAbstraction.Read(_socket, buffer, offset, length, InfiniteTimeSpan);
+            var bytesRead = SocketAbstraction.Read(socket, buffer, offset, length, InfiniteTimeSpan);
             if (bytesRead == 0)
             {
                 // when we're in the disconnecting state (either triggered by client or server), then the
                 // SshConnectionException will interrupt the message listener loop (if not already interrupted)
                 // and the exception itself will be ignored (in RaiseError)
                 throw new SshConnectionException("An established connection was aborted by the server.",
-                    DisconnectReason.ConnectionLost);
+                                                 DisconnectReason.ConnectionLost);
             }
             return bytesRead;
         }
@@ -1738,6 +1822,7 @@ namespace Renci.SshNet
         /// <summary>
         /// Performs a blocking read on the socket until <paramref name="length"/> bytes are received.
         /// </summary>
+        /// <param name="socket">The <see cref="Socket"/> to read from.</param>
         /// <param name="buffer">An array of type <see cref="byte"/> that is the storage location for the received data.</param>
         /// <param name="offset">The position in <paramref name="buffer"/> parameter to store the received data.</param>
         /// <param name="length">The number of bytes to read.</param>
@@ -1746,21 +1831,22 @@ namespace Renci.SshNet
         /// </returns>
         /// <exception cref="SshOperationTimeoutException">The read has timed-out.</exception>
         /// <exception cref="SocketException">The read failed.</exception>
-        private int TrySocketRead(byte[] buffer, int offset, int length)
+        private static int TrySocketRead(Socket socket, byte[] buffer, int offset, int length)
         {
-            return SocketAbstraction.Read(_socket, buffer, offset, length, InfiniteTimeSpan);
+            return SocketAbstraction.Read(socket, buffer, offset, length, InfiniteTimeSpan);
         }
 
         /// <summary>
         /// Performs a blocking read on the socket until a line is read.
         /// </summary>
+        /// <param name="socket">The <see cref="Socket"/> to read from.</param>
         /// <param name="timeout">A <see cref="TimeSpan"/> that represents the time to wait until a line is read.</param>
         /// <exception cref="SshOperationTimeoutException">The read has timed-out.</exception>
         /// <exception cref="SocketException">An error occurred when trying to access the socket.</exception>
         /// <returns>
         /// The line read from the socket, or <c>null</c> when the remote server has shutdown and all data has been received.
         /// </returns>
-        private string SocketReadLine(TimeSpan timeout)
+        private static string SocketReadLine(Socket socket, TimeSpan timeout)
         {
             var encoding = SshData.Ascii;
             var buffer = new List<byte>();
@@ -1770,7 +1856,7 @@ namespace Renci.SshNet
             // to be processed by subsequent invocations
             do
             {
-                var bytesRead = SocketAbstraction.Read(_socket, data, 0, data.Length, timeout);
+                var bytesRead = SocketAbstraction.Read(socket, data, 0, data.Length, timeout);
                 if (bytesRead == 0)
                     // the remote server shut down the socket
                     break;
@@ -1841,47 +1927,76 @@ namespace Renci.SshNet
         {
             try
             {
-                var readSockets = new List<Socket> {_socket};
-
                 // remain in message loop until socket is shut down or until we're disconnecting
-                while (_socket.IsConnected())
+                while (true)
                 {
-#if FEATURE_SOCKET_POLL
-                    // if the socket is already disposed when Select is invoked, then a SocketException
-                    // stating "An operation was attempted on something that is not a socket" is thrown;
-                    // we attempt to avoid this exception by having an IsConnected() that can break the
-                    // message loop
-                    //
-                    // note that there's no guarantee that the socket will not be disposed between the
-                    // IsConnected() check and the Select invocation; we can't take a "dispose" lock
-                    // that includes the Select invocation as we want Dispose() to be able to interrupt
-                    // the Select
+                    var socket = _socket;
 
-                    // perform a blocking select to determine whether there's is data available to be
-                    // read; we do not use a blocking read to allow us to use Socket.Poll to determine
-                    // if the connection is still available (in IsSocketConnected
-                    Socket.Select(readSockets, null, null, -1);
-
-                    // the Select invocation will be interrupted in one of the following conditions:
-                    // * data is available to be read
-                    //   => the socket will not be removed from "readSockets"
-                    // * the socket connection is closed during the Select invocation
-                    //   => the socket will be removed from "readSockets"
-                    // * the socket is disposed during the Select invocation
-                    //   => the socket will not be removed from "readSocket"
-                    // 
-                    // since we handle the second and third condition the same way and Socket.Connected
-                    // allows us to check for both conditions, we use that instead of both checking for
-                    // the removal from "readSockets" and the Connection check
-                    if (!_socket.IsConnected())
+                    if (socket == null || !socket.Connected)
                     {
-                        // connection with SSH server was closed or socket was disposed;
-                        // break out of the message loop
                         break;
                     }
-#endif // FEATURE_SOCKET_POLL
 
-                    var message = ReceiveMessage();
+#if FEATURE_SOCKET_POLL || FEATURE_SOCKET_SELECT
+                    try
+                    {
+#if FEATURE_SOCKET_POLL
+                        // Block until either data is available or the socket is closed
+                        var connectionClosedOrDataAvailable = socket.Poll(-1, SelectMode.SelectRead);
+                        if (connectionClosedOrDataAvailable && socket.Available == 0)
+                        {
+                            // connection with SSH server was closed or connection was reset
+                            break;
+                        }
+#elif FEATURE_SOCKET_SELECT
+                        var readSockets = new List<Socket> { socket };
+
+                        // if the socket is already disposed when Select is invoked, then a SocketException
+                        // stating "An operation was attempted on something that is not a socket" is thrown;
+                        // we attempt to avoid this exception by having an IsConnected() that can break the
+                        // message loop
+                        //
+                        // note that there's no guarantee that the socket will not be disposed between the
+                        // IsConnected() check and the Select invocation; we can't take a "dispose" lock
+                        // that includes the Select invocation as we want Dispose() to be able to interrupt
+                        // the Select
+
+                        // perform a blocking select to determine whether there's is data available to be
+                        // read; we do not use a blocking read to allow us to use Socket.Poll to determine
+                        // if the connection is still available (in IsSocketConnected)
+
+                        Socket.Select(readSockets, null, null, -1);
+
+                        // the Select invocation will be interrupted in one of the following conditions:
+                        // * data is available to be read
+                        //   => the socket will not be removed from "readSockets"
+                        // * the socket connection is closed during the Select invocation
+                        //   => the socket will be removed from "readSockets"
+                        // * the socket is disposed during the Select invocation
+                        //   => the socket will not be removed from "readSocket"
+                        // 
+                        // since we handle the second and third condition the same way and Socket.Connected
+                        // allows us to check for both conditions, we use that instead of both checking for
+                        // the removal from "readSockets" and the Connection check
+                        if (!socket.IsConnected())
+                        {
+                            // connection with SSH server was closed or socket was disposed;
+                            // break out of the message loop
+                            break;
+                        }
+#endif // FEATURE_SOCKET_SELECT
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        // The socket was disposed by either:
+                        // * a call to Disconnect()
+                        // * a call to Dispose()
+                        // * a SSH_MSG_DISCONNECT received from server
+                        break;
+                    }
+#endif // FEATURE_SOCKET_POLL || FEATURE_SOCKET_SELECT
+
+                    var message = ReceiveMessage(socket);
                     if (message == null)
                     {
                         // connection with SSH server was closed;
@@ -1893,7 +2008,7 @@ namespace Renci.SshNet
                     message.Process(this);
                 }
 
-                // connection with SSH server was closed
+                // connection with SSH server was closed or socket was disposed
                 RaiseError(CreateConnectionAbortedByServerException());
             }
             catch (SocketException ex)
@@ -1911,47 +2026,26 @@ namespace Renci.SshNet
             }
         }
 
-        private byte SocketReadByte()
+        private static byte SocketReadByte(Socket socket)
         {
             var buffer = new byte[1];
-            SocketRead(buffer, 0, 1);
+            SocketRead(socket, buffer, 0, 1);
             return buffer[0];
         }
 
-        private void SocketWriteByte(byte data)
+        private static void ConnectSocks4(Socket socket, ConnectionInfo connectionInfo)
         {
-            SocketAbstraction.Send(_socket, new[] {data});
-        }
+            var connectionRequest = CreateSocks4ConnectionRequest(connectionInfo.Host, (ushort)connectionInfo.Port, connectionInfo.ProxyUsername);
+            SocketAbstraction.Send(socket, connectionRequest);
 
-        private void ConnectSocks4()
-        {
-            //  Send socks version number
-            SocketWriteByte(0x04);
-
-            //  Send command code
-            SocketWriteByte(0x01);
-
-            //  Send port
-            SocketWriteByte((byte)(ConnectionInfo.Port / 0xFF));
-            SocketWriteByte((byte)(ConnectionInfo.Port % 0xFF));
-
-            //  Send IP
-            var ipAddress = DnsAbstraction.GetHostAddresses(ConnectionInfo.Host)[0];
-            SocketAbstraction.Send(_socket, ipAddress.GetAddressBytes());
-
-            //  Send username
-            var username = SshData.Ascii.GetBytes(ConnectionInfo.ProxyUsername);
-            SocketAbstraction.Send(_socket, username);
-            SocketWriteByte(0x00);
-
-            //  Read 0
-            if (SocketReadByte() != 0)
+            //  Read null byte
+            if (SocketReadByte(socket) != 0)
             {
                 throw new ProxyException("SOCKS4: Null is expected.");
             }
 
             //  Read response code
-            var code = SocketReadByte();
+            var code = SocketReadByte(socket);
 
             switch (code)
             {
@@ -1968,112 +2062,61 @@ namespace Renci.SshNet
             }
 
             var dummyBuffer = new byte[6]; // field 3 (2 bytes) and field 4 (4) should be ignored
-            SocketRead(dummyBuffer, 0, 6);
+            SocketRead(socket, dummyBuffer, 0, 6);
         }
 
-        private void ConnectSocks5()
+        private static void ConnectSocks5(Socket socket, ConnectionInfo connectionInfo)
         {
-            //  Send socks version number
-            SocketWriteByte(0x05);
+            var greeting = new byte[]
+                {
+                    // SOCKS version number
+                    0x05,
+                    // Number of supported authentication methods
+                    0x02,
+                    // No authentication
+                    0x00,
+                    // Username/Password authentication
+                    0x02
+                };
+            SocketAbstraction.Send(socket, greeting);
 
-            //  Send number of supported authentication methods
-            SocketWriteByte(0x02);
-
-            //  Send supported authentication methods
-            SocketWriteByte(0x00); //  No authentication
-            SocketWriteByte(0x02); //  Username/Password
-
-            var socksVersion = SocketReadByte();
+            var socksVersion = SocketReadByte(socket);
             if (socksVersion != 0x05)
                 throw new ProxyException(string.Format("SOCKS Version '{0}' is not supported.", socksVersion));
 
-            var authenticationMethod = SocketReadByte();
+            var authenticationMethod = SocketReadByte(socket);
             switch (authenticationMethod)
             {
                 case 0x00:
                     break;
                 case 0x02:
+                    // Create username/password authentication request
+                    var authenticationRequest = CreateSocks5UserNameAndPasswordAuthenticationRequest(connectionInfo.ProxyUsername, connectionInfo.ProxyPassword);
+                    // Send authentication request
+                    SocketAbstraction.Send(socket, authenticationRequest);
+                    // Read authentication result
+                    var authenticationResult = SocketAbstraction.Read(socket, 2, connectionInfo.Timeout);
 
-                    //  Send version
-                    SocketWriteByte(0x01);
-
-                    var username = SshData.Ascii.GetBytes(ConnectionInfo.ProxyUsername);
-
-                    if (username.Length > byte.MaxValue)
-                        throw new ProxyException("Proxy username is too long.");
-
-                    //  Send username length
-                    SocketWriteByte((byte)username.Length);
-
-                    //  Send username
-                    SocketAbstraction.Send(_socket, username);
-
-                    var password = SshData.Ascii.GetBytes(ConnectionInfo.ProxyPassword);
-
-                    if (password.Length > byte.MaxValue)
-                        throw new ProxyException("Proxy password is too long.");
-
-                    //  Send username length
-                    SocketWriteByte((byte)password.Length);
-
-                    //  Send username
-                    SocketAbstraction.Send(_socket, password);
-
-                    var serverVersion = SocketReadByte();
-
-                    if (serverVersion != 1)
+                    if (authenticationResult[0] != 0x01)
                         throw new ProxyException("SOCKS5: Server authentication version is not valid.");
-
-                    var statusCode = SocketReadByte();
-                    if (statusCode != 0)
+                    if (authenticationResult[1] != 0x00)
                         throw new ProxyException("SOCKS5: Username/Password authentication failed.");
-
                     break;
                 case 0xFF:
                     throw new ProxyException("SOCKS5: No acceptable authentication methods were offered.");
             }
 
-            //  Send socks version number
-            SocketWriteByte(0x05);
-
-            //  Send command code
-            SocketWriteByte(0x01); //  establish a TCP/IP stream connection
-
-            //  Send reserved, must be 0x00
-            SocketWriteByte(0x00);
-
-            var ip = DnsAbstraction.GetHostAddresses(ConnectionInfo.Host)[0];
-
-            //  Send address type and address
-            if (ip.AddressFamily == AddressFamily.InterNetwork)
-            {
-                SocketWriteByte(0x01);
-                var address = ip.GetAddressBytes();
-                SocketAbstraction.Send(_socket, address);
-            }
-            else if (ip.AddressFamily == AddressFamily.InterNetworkV6)
-            {
-                SocketWriteByte(0x04);
-                var address = ip.GetAddressBytes();
-                SocketAbstraction.Send(_socket, address);
-            }
-            else
-            {
-                throw new ProxyException(string.Format("SOCKS5: IP address '{0}' is not supported.", ip));
-            }
-
-            //  Send port
-            SocketWriteByte((byte)(ConnectionInfo.Port / 0xFF));
-            SocketWriteByte((byte)(ConnectionInfo.Port % 0xFF));
+            var connectionRequest = CreateSocks5ConnectionRequest(connectionInfo.Host, (ushort)connectionInfo.Port);
+            SocketAbstraction.Send(socket, connectionRequest);
 
             //  Read Server SOCKS5 version
-            if (SocketReadByte() != 5)
+            if (SocketReadByte(socket) != 5)
             {
                 throw new ProxyException("SOCKS5: Version 5 is expected.");
             }
 
             //  Read response code
-            var status = SocketReadByte();
+            var status = SocketReadByte(socket);
 
             switch (status)
             {
@@ -2096,25 +2139,25 @@ namespace Renci.SshNet
                 case 0x08:
                     throw new ProxyException("SOCKS5: Address type not supported.");
                 default:
-                    throw new ProxyException("SOCKS4: Not valid response.");
+                    throw new ProxyException("SOCKS5: Not valid response.");
             }
 
-            //  Read 0
-            if (SocketReadByte() != 0)
+            //  Read reserved byte
+            if (SocketReadByte(socket) != 0)
             {
                 throw new ProxyException("SOCKS5: 0 byte is expected.");
             }
 
-            var addressType = SocketReadByte();
-            var responseIp = new byte[16];
-
+            var addressType = SocketReadByte(socket);
             switch (addressType)
             {
                 case 0x01:
-                    SocketRead(responseIp, 0, 4);
+                    var ipv4 = new byte[4];
+                    SocketRead(socket, ipv4, 0, 4);
                     break;
                 case 0x04:
-                    SocketRead(responseIp, 0, 16);
+                    var ipv6 = new byte[16];
+                    SocketRead(socket, ipv6, 0, 16);
                     break;
                 default:
                     throw new ProxyException(string.Format("Address type '{0}' is not supported.", addressType));
@@ -2123,33 +2166,201 @@ namespace Renci.SshNet
             var port = new byte[2];
 
             //  Read 2 bytes to be ignored
-            SocketRead(port, 0, 2);
+            SocketRead(socket, port, 0, 2);
         }
 
-        private void ConnectHttp()
+        /// <summary>
+        /// https://tools.ietf.org/html/rfc1929
+        /// </summary>
+        private static byte[] CreateSocks5UserNameAndPasswordAuthenticationRequest(string username, string password)
+        {
+            if (username.Length > byte.MaxValue)
+                throw new ProxyException("Proxy username is too long.");
+            if (password.Length > byte.MaxValue)
+                throw new ProxyException("Proxy password is too long.");
+
+            var authenticationRequest = new byte
+                [
+                    // Version of the negotiation
+                    1 +
+                    // Length of the username
+                    1 +
+                    // Username
+                    username.Length +
+                    // Length of the password
+                    1 +
+                    // Password
+                    password.Length
+                ];
+
+            var index = 0;
+
+            // Version of the negiotiation
+            authenticationRequest[index++] = 0x01;
+
+            // Length of the username
+            authenticationRequest[index++] = (byte) username.Length;
+
+            // Username
+            SshData.Ascii.GetBytes(username, 0, username.Length, authenticationRequest, index);
+            index += username.Length;
+
+            // Length of the password
+            authenticationRequest[index++] = (byte) password.Length;
+
+            // Password
+            SshData.Ascii.GetBytes(password, 0, password.Length, authenticationRequest, index);
+
+            return authenticationRequest;
+        }
+
+        private static byte[] CreateSocks4ConnectionRequest(string hostname, ushort port, string username)
+        {
+            var addressBytes = GetSocks4DestinationAddress(hostname);
+
+            var connectionRequest = new byte
+                [
+                    // SOCKS version number
+                    1 +
+                    // Command code
+                    1 +
+                    // Port number
+                    2 +
+                    // IP address
+                    addressBytes.Length +
+                    // Username
+                    username.Length +
+                    // Null terminator
+                    1
+                ];
+
+            var index = 0;
+
+            // SOCKS version number
+            connectionRequest[index++] = 0x04;
+
+            // Command code
+            connectionRequest[index++] = 0x01; // establish a TCP/IP stream connection
+
+            // Port number
+            Pack.UInt16ToBigEndian(port, connectionRequest, index);
+            index += 2;
+
+            // Address
+            Buffer.BlockCopy(addressBytes, 0, connectionRequest, index, addressBytes.Length);
+            index += addressBytes.Length;
+
+            connectionRequest[index] = 0x00;
+
+            return connectionRequest;
+        }
+
+        private static byte[] CreateSocks5ConnectionRequest(string hostname, ushort port)
+        {
+            byte addressType;
+            var addressBytes = GetSocks5DestinationAddress(hostname, out addressType);
+
+            var connectionRequest = new byte
+                [
+                    // SOCKS version number
+                    1 +
+                    // Command code
+                    1 +
+                    // Reserved
+                    1 +
+                    // Address type
+                    1 +
+                    // Address
+                    addressBytes.Length +
+                    // Port number
+                    2
+                ];
+
+            var index = 0;
+
+            // SOCKS version number
+            connectionRequest[index++] = 0x05;
+
+            // Command code
+            connectionRequest[index++] = 0x01; // establish a TCP/IP stream connection
+
+            // Reserved
+            connectionRequest[index++] = 0x00;
+
+            // Address type
+            connectionRequest[index++] = addressType;
+            
+            // Address
+            Buffer.BlockCopy(addressBytes, 0, connectionRequest, index, addressBytes.Length);
+            index += addressBytes.Length;
+
+            // Port number
+            Pack.UInt16ToBigEndian(port, connectionRequest, index);
+
+            return connectionRequest;
+        }
+
+        private static byte[] GetSocks4DestinationAddress(string hostname)
+        {
+            var addresses = DnsAbstraction.GetHostAddresses(hostname);
+
+            for (var i = 0; i < addresses.Length; i++)
+            {
+                var address = addresses[i];
+                if (address.AddressFamily == AddressFamily.InterNetwork)
+                    return address.GetAddressBytes();
+            }
+
+            throw new ProxyException(string.Format("SOCKS4 only supports IPv4. No such address found for '{0}'.", hostname));
+        }
+
+        private static byte[] GetSocks5DestinationAddress(string hostname, out byte addressType)
+        {
+            var ip = DnsAbstraction.GetHostAddresses(hostname)[0];
+
+            byte[] address;
+
+            switch (ip.AddressFamily)
+            {
+                case AddressFamily.InterNetwork:
+                    addressType = 0x01; // IPv4
+                    address = ip.GetAddressBytes();
+                    break;
+                case AddressFamily.InterNetworkV6:
+                    addressType = 0x04; // IPv6
+                    address = ip.GetAddressBytes();
+                    break;
+                default:
+                    throw new ProxyException(string.Format("SOCKS5: IP address '{0}' is not supported.", ip));
+            }
+
+            return address;
+        }
+
+        private static void ConnectHttp(Socket socket, ConnectionInfo connectionInfo)
         {
             var httpResponseRe = new Regex(@"HTTP/(?<version>\d[.]\d) (?<statusCode>\d{3}) (?<reasonPhrase>.+)$");
             var httpHeaderRe = new Regex(@"(?<fieldName>[^\[\]()<>@,;:\""/?={} \t]+):(?<fieldValue>.+)?");
 
-            SocketAbstraction.Send(_socket, SshData.Ascii.GetBytes(string.Format("CONNECT {0}:{1} HTTP/1.0\r\n", ConnectionInfo.Host, ConnectionInfo.Port)));
+            SocketAbstraction.Send(socket, SshData.Ascii.GetBytes(string.Format("CONNECT {0}:{1} HTTP/1.0\r\n", connectionInfo.Host, connectionInfo.Port)));
 
             //  Sent proxy authorization is specified
-            if (!string.IsNullOrEmpty(ConnectionInfo.ProxyUsername))
+            if (!string.IsNullOrEmpty(connectionInfo.ProxyUsername))
             {
                 var authorization = string.Format("Proxy-Authorization: Basic {0}\r\n",
-                                                  Convert.ToBase64String(SshData.Ascii.GetBytes(string.Format("{0}:{1}", ConnectionInfo.ProxyUsername, ConnectionInfo.ProxyPassword)))
+                                                  Convert.ToBase64String(SshData.Ascii.GetBytes(string.Format("{0}:{1}", connectionInfo.ProxyUsername, connectionInfo.ProxyPassword)))
                                                   );
-                SocketAbstraction.Send(_socket, SshData.Ascii.GetBytes(authorization));
+                SocketAbstraction.Send(socket, SshData.Ascii.GetBytes(authorization));
             }
 
-            SocketAbstraction.Send(_socket, SshData.Ascii.GetBytes("\r\n"));
+            SocketAbstraction.Send(socket, SshData.Ascii.GetBytes("\r\n"));
 
             HttpStatusCode? statusCode = null;
             var contentLength = 0;
 
             while (true)
             {
-                var response = SocketReadLine(ConnectionInfo.Timeout);
+                var response = SocketReadLine(socket, connectionInfo.Timeout);
                 if (response == null)
                     // server shut down socket
                     break;
@@ -2191,7 +2402,7 @@ namespace Renci.SshNet
                     if (contentLength > 0)
                     {
                         var contentBody = new byte[contentLength];
-                        SocketRead(contentBody, 0, contentLength);
+                        SocketRead(socket, contentBody, 0, contentLength);
                     }
                     break;
                 }
@@ -2209,7 +2420,7 @@ namespace Renci.SshNet
         {
             var connectionException = exp as SshConnectionException;
 
-            DiagnosticAbstraction.Log(string.Format("[{0}] {1} Raised exception: {2}", ToHex(SessionId), DateTime.Now.Ticks, exp));
+            DiagnosticAbstraction.Log(string.Format("[{0}] Raised exception: {1}", ToHex(SessionId), exp));
 
             if (_isDisconnecting)
             {
@@ -2225,6 +2436,7 @@ namespace Renci.SshNet
                     return;
             }
 
+            // "save" exception and set exception wait handle to ensure any waits are interrupted
             _exception = exp;
             _exceptionWaitHandle.Set();
 
@@ -2234,7 +2446,7 @@ namespace Renci.SshNet
 
             if (connectionException != null)
             {
-                DiagnosticAbstraction.Log(string.Format("[{0}] {1} Disconnecting after exception: {2}", ToHex(SessionId), DateTime.Now.Ticks, exp));
+                DiagnosticAbstraction.Log(string.Format("[{0}] Disconnecting after exception: {1}", ToHex(SessionId), exp));
                 Disconnect(connectionException.DisconnectReason, exp.ToString());
             }
         }
@@ -2263,7 +2475,7 @@ namespace Renci.SshNet
         private static SshConnectionException CreateConnectionAbortedByServerException()
         {
             return new SshConnectionException("An established connection was aborted by the server.",
-                DisconnectReason.ConnectionLost);
+                                              DisconnectReason.ConnectionLost);
         }
 
 #region IDisposable implementation
@@ -2290,7 +2502,7 @@ namespace Renci.SshNet
 
             if (disposing)
             {
-                DiagnosticAbstraction.Log(string.Format("[{0}] Disposing session", ToHex(SessionId)));
+                DiagnosticAbstraction.Log(string.Format("[{0}] Disposing session.", ToHex(SessionId)));
 
                 Disconnect();
 
@@ -2403,8 +2615,9 @@ namespace Renci.SshNet
         /// <returns>
         /// A new "forwarded-tcpip" SSH channel.
         /// </returns>
-        IChannelForwardedTcpip ISession.CreateChannelForwardedTcpip(uint remoteChannelNumber, uint remoteWindowSize,
-            uint remoteChannelDataPacketSize)
+        IChannelForwardedTcpip ISession.CreateChannelForwardedTcpip(uint remoteChannelNumber,
+                                                                    uint remoteWindowSize,
+                                                                    uint remoteChannelDataPacketSize)
         {
             return new ChannelForwardedTcpip(this,
                                              NextChannelNumber,
@@ -2445,5 +2658,31 @@ namespace Renci.SshNet
         }
 
 #endregion ISession implementation
+    }
+
+    /// <summary>
+    /// Represents the result of a wait operations.
+    /// </summary>
+    internal enum WaitResult
+    {
+        /// <summary>
+        /// The <see cref="WaitHandle"/> was signaled within the specified interval.
+        /// </summary>
+        Success = 1,
+
+        /// <summary>
+        /// The <see cref="WaitHandle"/> was not signaled within the specified interval.
+        /// </summary>
+        TimedOut = 2,
+
+        /// <summary>
+        /// The session is in a disconnected state.
+        /// </summary>
+        Disconnected = 3,
+
+        /// <summary>
+        /// The session is in a failed state.
+        /// </summary>
+        Failed = 4
     }
 }
